@@ -1,43 +1,27 @@
 use futures::{StreamExt, stream::FuturesUnordered, Future};
 use reqwest::Url;
+use select::{document::Document, predicate::Name};
+
 use std::collections::HashSet;
 use std::io::Write;
 use std::str::FromStr;
-
-use select::document::Document;
-use select::predicate::Name;
-
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone)]
-pub struct Links {
-    all: Arc<Mutex<HashSet<Url>>>,
+use crate::link_unificator::LinkUnificator;
+
+pub struct Links<U: LinkUnificator> {
+    all: Arc<Mutex<HashSet<U::Unified>>>,
     new: Arc<Mutex<Vec<Url>>>,
+    phantom: PhantomData<U>,
 }
 
-impl Links {
-    /// # panic
-    /// * if `init_links` is empty
-    /// * if any links from `init_links` is bad url
-    pub fn new<'x>(init_links: impl IntoIterator<Item = &'x str>) -> Self {
-        let all = HashSet::from_iter(init_links.into_iter().map(
-            |link|Url::from_str(link).unwrap_or_else(|e|panic!("bad URL({e}): {link}"))
-        ));
-        if all.is_empty() { panic!("`init_links` was empty") }
-
-        let new = Vec::from_iter(all.iter().map(|x|x.clone()));
-
-        Self {
-            all: Arc::new(Mutex::new(all)),
-            new: Arc::new(Mutex::new(new)),
-        }
-    }
-
+impl<U: LinkUnificator> Links<U> {
     fn lock_new(&self) -> anyhow::Result<std::sync::MutexGuard<Vec<Url>>> {
         self.new.lock().map_err(|_|anyhow::anyhow!("`Mutex` was poisoned"))
     }
 
-    fn lock_all(&self) -> anyhow::Result<std::sync::MutexGuard<HashSet<Url>>> {
+    fn lock_all(&self) -> anyhow::Result<std::sync::MutexGuard<HashSet<U::Unified>>> {
         self.all.lock().map_err(|_|anyhow::anyhow!("`Mutex` was poisoned"))
     }
 
@@ -51,6 +35,38 @@ impl Links {
             Ok(all) => all.len(),
             _ => 0, // not sure
         }
+    }
+}
+
+impl<U: LinkUnificator> Links<U>
+where U::Unified: std::hash::Hash + Eq
+{
+    /// # panic
+    /// * if `init_links` is empty
+    /// * if any links from `init_links` is bad url
+    pub fn new<'x>(init_links: impl IntoIterator<Item = &'x str>) -> anyhow::Result<Self> {
+        let mut all = HashSet::new();
+        let mut new = Vec::new();
+
+        for link in init_links {
+            let link = Url::from_str(link).map_err(|e|anyhow::anyhow!("bad URL({e}): {link}"))?;
+            let unify_link = U::unify(&link);
+            if all.insert(unify_link) {
+                new.push(link)
+            }
+        }
+        if all.is_empty() { anyhow::bail!("`init_links` was empty") }
+
+        Ok(Self {
+            all: Arc::new(Mutex::new(all)),
+            new: Arc::new(Mutex::new(new)),
+            phantom: PhantomData,
+        })
+    }
+
+    pub fn new_from_file<'x>(init_links_file: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        let links = std::fs::read_to_string(init_links_file)?;
+        Self::new(links.lines().map(|line|line.trim()).filter(|link|!link.is_empty()))
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -77,7 +93,7 @@ impl Links {
     /// * `Err(..)` when an error occurs
     async fn extract_one_more(mut self) -> anyhow::Result<bool> {
         let Some(link) = self.take_unchecked_url()? else { return Ok(false) };
-        let body = Links::load(link.as_str()).await?;
+        let body = Links::<U>::load(link.as_str()).await?;
 
         let body = Document::from(body.as_str());
         let body_links = body
@@ -89,12 +105,13 @@ impl Links {
             let mut all = self.lock_all()?;
 
             for potential_new_link in body_links {
-                let potential_new_link = Links::absolute_link(&link, potential_new_link)?;
+                let potential_new_link = Links::<U>::absolute_link(&link, potential_new_link)?;
+                let unified_pot_new_link = U::unify(&potential_new_link);
 
-                if !all.contains(&potential_new_link) {
-                    let new_link = potential_new_link;
-                    all.insert(new_link.clone());
-                    new.push(new_link);
+                if !all.contains(&unified_pot_new_link) {
+                    // it's actually new link:
+                    all.insert(unified_pot_new_link);
+                    new.push(potential_new_link);
                 }
             }
         }
@@ -120,10 +137,26 @@ impl Links {
     }
 }
 
-impl std::fmt::Display for Links {
+impl<U: LinkUnificator> Links<U>
+where U::Unified: std::fmt::Display
+{
+    pub fn save_to_file(&self, path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
+        let mut f = std::fs::File::create(path)?;
+        let links = self.lock_all()?;
+        for link in links.iter() {
+            writeln!(f, "{link}")?
+        }
+        Ok(())
+    }  
+}
+
+
+impl<U: LinkUnificator> std::fmt::Display for Links<U>
+where U::Unified: std::fmt::Display
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "[{}]:", self.len())?;
-        let Ok(all) = self.all.lock() else { return Ok(()) };
+        let Ok(all) = self.all.lock() else { return writeln!(f, "<poisoned Mutex>") };
         for link in all.iter() {
             writeln!(f, "{link}")?
         }
@@ -131,17 +164,27 @@ impl std::fmt::Display for Links {
     }
 }
 
+// because `U`/`U::Unified` can not impl `Clone` => `#[derive(Clone)]` will not working 
+impl<U: LinkUnificator> Clone for Links<U> {
+    fn clone(&self) -> Self {
+        Self { 
+            all: self.all.clone(), 
+            new: self.new.clone(), 
+            phantom: self.phantom.clone()
+        }
+    }
+}
 
-struct LinksCounter<'x> {
-    links: &'x Links,
+struct LinksCounter<'x, U: LinkUnificator> {
+    links: &'x Links<U>,
     cur_run: usize,
     total_run: usize,
     max_together: Option<usize>,
     print: bool,
 }
 
-impl<'x> LinksCounter<'x> {
-    pub fn new(links: &'x Links, max_together: Option<usize>) -> Self {
+impl<'x, U: LinkUnificator> LinksCounter<'x, U> {
+    pub fn new(links: &'x Links<U>, max_together: Option<usize>) -> Self {
         let max_together = max_together.map(|x|usize::max(1, x));
 
         Self {
@@ -171,7 +214,7 @@ impl<'x> LinksCounter<'x> {
         }
     }
 
-    fn awaiter_filling(&mut self, mut awaiter_push: impl FnMut(Links)) {
+    fn awaiter_filling(&mut self, mut awaiter_push: impl FnMut(Links<U>)) {
         'awaiter_filling: loop {
             let can_add = self.max_together.map(|max|self.cur_run < max).unwrap_or(true);
             if !can_add { break 'awaiter_filling }
