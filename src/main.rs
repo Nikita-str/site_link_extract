@@ -5,13 +5,13 @@ async fn main() -> anyhow::Result<()> {
     let mut links = Links::new(vec!["https://www.superbad.com"]);
     
     // // load link by link (slow):  
-    // links.take_all_unique(Some(1), true).await?;
+    // links.extract_all_unique(Some(1), true).await?;
 
     // // load scoped but no more 8 at the same time:
-    // links.take_all_unique(Some(8), true).await?;
+    // links.extract_all_unique(Some(8), true).await?;
     
     // load scoped and without restrictions:
-    links.take_all_unique(None, true).await?;
+    links.extract_all_unique(None, true).await?;
     
     println!("{links}");
     Ok(())

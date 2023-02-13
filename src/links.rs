@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures::{StreamExt, stream::FuturesUnordered, Future};
 use reqwest::Url;
 use std::collections::HashSet;
 use std::io::Write;
@@ -33,39 +33,63 @@ impl Links {
         }
     }
 
-    /// # return
-    /// * `Ok(true)` when there still exist unchecked links
-    /// * `Ok(false)` when nothing more to check
-    /// * `Err(..)` when an error occurs
-    pub async fn next(self) -> anyhow::Result<bool> {
-        let link = { // to drop MutexGuard
-            let Ok(mut new) = self.new.lock() else { anyhow::bail!("`Mutex` was poisoned") };
-            let Some(link) = new.pop() else { return Ok(false) };
-            link
+    fn lock_new(&self) -> anyhow::Result<std::sync::MutexGuard<Vec<Url>>> {
+        self.new.lock().map_err(|_|anyhow::anyhow!("`Mutex` was poisoned"))
+    }
+
+    fn lock_all(&self) -> anyhow::Result<std::sync::MutexGuard<HashSet<Url>>> {
+        self.all.lock().map_err(|_|anyhow::anyhow!("`Mutex` was poisoned"))
+    }
+
+    fn take_unchecked_url(&mut self) -> anyhow::Result<Option<Url>> {
+        let mut new = self.lock_new()?;
+        Ok(new.pop())
+    }
+
+    pub fn len(&self) -> usize {
+        match self.all.lock() {
+            Ok(all) => all.len(),
+            _ => 0, // not sure
+        }
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [+] help fns for `extract_one_more`
+    async fn load(link: impl reqwest::IntoUrl) -> anyhow::Result<String> {
+        let body = reqwest::get(link).await?.text().await?;
+        Ok(body)
+    }
+
+    fn absolute_link(potential_parent: &Url, link: &str) -> anyhow::Result<Url> {
+        let abs_link = if link.contains("://") {
+            reqwest::Url::from_str(link)?
+        } else {
+            potential_parent.join(link)?
         };
+        Ok(abs_link)
+    }
+    // [-] help fns for `extract_one_more`
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        let body = reqwest::get(link.as_str())
-            .await?
-            .text()
-            .await?;
+    /// # return
+    /// * `Ok(true)` when another unchecked url succesfully was checked 
+    /// * `Ok(false)` when there no unchecked url
+    /// * `Err(..)` when an error occurs
+    async fn extract_one_more(mut self) -> anyhow::Result<bool> {
+        let Some(link) = self.take_unchecked_url()? else { return Ok(false) };
+        let body = Links::load(link.as_str()).await?;
 
-        let body_links = Document::from(body.as_str());
-        let body_links = body_links
+        let body = Document::from(body.as_str());
+        let body_links = body
             .find(Name("a"))
             .filter_map(|node| node.attr("href"));
 
         { // to drop MutexGuard
-            let Ok(mut new) = self.new.lock() else { anyhow::bail!("`Mutex` was poisoned") };
-            let Ok(mut all) = self.all.lock() else { anyhow::bail!("`Mutex` was poisoned") };
+            let mut new = self.lock_new()?;
+            let mut all = self.lock_all()?;
 
             for potential_new_link in body_links {
-                let url = reqwest::Url::from_str(link.as_str())?;
-
-                let potential_new_link = if potential_new_link.contains("://") {
-                    reqwest::Url::from_str(potential_new_link)?
-                } else {
-                    url.join(potential_new_link)?
-                };
+                let potential_new_link = Links::absolute_link(&link, potential_new_link)?;
 
                 if !all.contains(&potential_new_link) {
                     let new_link = potential_new_link;
@@ -78,53 +102,20 @@ impl Links {
         Ok(true)
     }
 
-
-    pub async fn take_all_unique(&mut self, max_together: Option<usize>, print: bool) -> anyhow::Result<()> {
-        let max_together = max_together.map(|x|usize::max(1, x));
-
-        let mut cur_run = 0;
-        let mut total_run = 0;
-
-        let mut awaited = futures::stream::FuturesUnordered::new();
+    pub async fn extract_all_unique(&mut self, max_together: Option<usize>, print: bool) -> anyhow::Result<()> {
+        let mut awaiter = futures::stream::FuturesUnordered::new();
+        let mut links_counter = LinksCounter::new(self, max_together);
+        if print { links_counter.print_on() }
 
         loop {
-            'awaiter_filling: loop {
-                let can_add = max_together.map(|max|cur_run < max).unwrap_or(true);
-                if !can_add { break 'awaiter_filling }
-                
-                if total_run < self.len() {
-                    cur_run += 1;
-                    total_run += 1;
-                    awaited.push(self.clone().next());
-                } else {
-                    break 'awaiter_filling
-                }
-            }
+            links_counter.awaiter_filling(|link|awaiter.push(link.extract_one_more()));
+            
+            // `if awaiter.is_empty() {..}` is the same case as
+            //             `awaiter.next().await` return `None`
+            //             this case catched in `awaiter_next_await`
 
-            // `if awaited.is_empty() {..}` is the same case as
-            //             `awaited.next().await` return `None`
-
-            match awaited.next().await {
-                Some(result) => {
-                    cur_run -= 1;
-                    let _ = result?;            
-                    if print {
-                        print!("+");
-                        std::io::stdout().flush()?;
-                    }
-                }
-                None => {
-                    if print { println!() }
-                    return Ok(())
-                }
-            }
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        match self.all.lock() {
-            Ok(all) => all.len(),
-            _ => 0, // not sure
+            let smth_awaited = links_counter.awaiter_next_await(&mut awaiter).await?;
+            if !smth_awaited { return Ok(()) }
         }
     }
 }
@@ -137,5 +128,79 @@ impl std::fmt::Display for Links {
             writeln!(f, "{link}")?
         }
         Ok(())
+    }
+}
+
+
+struct LinksCounter<'x> {
+    links: &'x Links,
+    cur_run: usize,
+    total_run: usize,
+    max_together: Option<usize>,
+    print: bool,
+}
+
+impl<'x> LinksCounter<'x> {
+    pub fn new(links: &'x Links, max_together: Option<usize>) -> Self {
+        let max_together = max_together.map(|x|usize::max(1, x));
+
+        Self {
+            links,
+            cur_run: 0,
+            total_run: 0,
+            max_together,
+            print: false,
+        }
+    }
+
+    fn print_on(&mut self) {
+        self.print = true;
+    }
+
+    fn print_another_one(&self) -> anyhow::Result<()> {
+        if self.print {
+            print!("+");
+            std::io::stdout().flush()?;
+        }
+        Ok(())
+    }
+
+    fn print_last(&self) {
+        if self.print {
+            println!()
+        }
+    }
+
+    fn awaiter_filling(&mut self, mut awaiter_push: impl FnMut(Links)) {
+        'awaiter_filling: loop {
+            let can_add = self.max_together.map(|max|self.cur_run < max).unwrap_or(true);
+            if !can_add { break 'awaiter_filling }
+            
+            if self.total_run < self.links.len() {
+                self.cur_run += 1;
+                self.total_run += 1;
+                awaiter_push(self.links.clone()); // awaiter.push(self.links.clone().extract_one_more());
+            } else {
+                break 'awaiter_filling
+            }
+        }
+    }
+
+    /// # return
+    /// * `Ok(true)` => next() future was sucessfully ended 
+    /// * `Ok(false)` => there was nothing to await
+    async fn awaiter_next_await(&mut self, awaiter: &mut FuturesUnordered<impl Future<Output = anyhow::Result<bool>>>) -> anyhow::Result<bool> {
+        match awaiter.next().await {
+            Some(result) => {
+                self.cur_run -= 1;
+                let _ = result?;
+                self.print_another_one()?;
+                Ok(true)
+            }
+            None => {
+                self.print_last();
+                Ok(false)
+            }
+        }
     }
 }
