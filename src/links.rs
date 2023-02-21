@@ -44,11 +44,12 @@ where U::Unified: std::hash::Hash + Eq
     /// # panic
     /// * if `init_links` is empty
     /// * if any links from `init_links` is bad url
-    pub fn new<'x>(init_links: impl IntoIterator<Item = &'x str>) -> anyhow::Result<Self> {
+    pub fn new<'x>(init_links: impl IntoIterator<Item = impl AsRef<str>>) -> anyhow::Result<Self> {
         let mut all = HashSet::new();
         let mut new = Vec::new();
 
         for link in init_links {
+            let link = link.as_ref();
             let link = Url::from_str(link).map_err(|e|anyhow::anyhow!("bad URL({e}): {link}"))?;
             let unify_link = U::unify(&link);
             if all.insert(unify_link) {
